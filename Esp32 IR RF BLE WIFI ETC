@@ -1,0 +1,829 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <esp_gap_ble_api.h>
+#include <esp_bt_main.h>
+
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <IRutils.h>
+
+#define OLED_W 128
+#define OLED_H 64
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+
+#define BTN_UP 12
+#define BTN_DOWN 14
+#define BTN_SEL 27
+#define IR_RX 15
+#define IR_TX 4
+
+#define RF_RX_PIN 36 
+#define RF_TX_PIN 13 
+#define BATTERY_PIN 34
+
+#define MAX_RAW_LEN 600   
+#define TOTAL_SLOTS 5     
+#define TOTAL_RF_SLOTS 5   
+#define AUTO_SLEEP_TIMEOUT 45000 
+
+#ifndef kRawTick
+#define kRawTick 50
+#endif
+
+IRrecv irrecv(IR_RX, 1024, 50, true);
+IRsend irsend(IR_TX);
+decode_results results;
+Preferences prefs;
+WebServer server(80);
+
+int menuIndex = 0;
+const int TOTAL_MENU_ITEMS = 16;
+bool redraw = true;
+unsigned long lastBtn = 0;
+unsigned long lastActivity = 0;
+
+uint16_t rawCodes[TOTAL_SLOTS][MAX_RAW_LEN];
+uint16_t fuzzedBuffer[MAX_RAW_LEN];
+uint16_t rawLengths[TOTAL_SLOTS];
+String signalTypes[TOTAL_SLOTS];
+bool slotActive[TOTAL_SLOTS] = {false};
+
+uint32_t rfCodes[TOTAL_RF_SLOTS] = {0};
+bool rfSlotActive[TOTAL_RF_SLOTS] = {false};
+
+bool webActionUp = false;
+bool webActionDown = false;
+bool webActionSel = false;
+bool webServerRunning = false;
+
+const unsigned char PROGMEM phantom_logo_bmp[] = {
+  0x00, 0x03, 0xC0, 0x00, 0x00, 0x07, 0xE0, 0x00, 0x00, 0x0C, 0x30, 0x00, 0x00, 0x18, 0x18, 0x00,
+  0x00, 0x30, 0x0C, 0x00, 0x80, 0x60, 0x06, 0x01, 0xC0, 0xC0, 0x03, 0x03, 0x61, 0x80, 0x01, 0x86,
+  0x33, 0x0F, 0xF0, 0xCC, 0x1E, 0x1C, 0x38, 0x78, 0x0C, 0x38, 0x1C, 0x30, 0x00, 0x70, 0x0E, 0x00,
+  0x00, 0x60, 0x06, 0x00, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x87, 0xE1, 0x80, 0x03, 0x0C, 0x30, 0xC0,
+  0x06, 0x18, 0x18, 0x60, 0x0C, 0x30, 0x0C, 0x30, 0x18, 0x60, 0x06, 0x18, 0x30, 0xC0, 0x03, 0x0C,
+  0x61, 0x80, 0x01, 0x86, 0xC3, 0x00, 0x00, 0xC3, 0x86, 0x00, 0x00, 0x61, 0x0C, 0x00, 0x00, 0x30,
+  0x18, 0x00, 0x00, 0x18, 0x30, 0x00, 0x00, 0x0C, 0x20, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00
+};
+
+int getBatteryPercentage() {
+  int sensorValue = analogRead(BATTERY_PIN);
+  float voltage = sensorValue * (3.3 / 4095.0) * 2.0;
+  int percentage = (int)((voltage - 3.3) / (4.2 - 3.3) * 100);
+  if (percentage > 100) return 100;
+  if (percentage < 0) return 0;
+  return percentage;
+}
+
+bool btnPressed(int pin) {
+  if (digitalRead(pin) == LOW || webActionUp || webActionDown || webActionSel) {
+    if (webActionUp) { webActionUp = false; lastActivity = millis(); return true; }
+    if (webActionDown) { webActionDown = false; lastActivity = millis(); return true; }
+    if (webActionSel) { webActionSel = false; lastActivity = millis(); return true; }
+
+    if (millis() - lastBtn > 200) {
+      lastBtn = millis();
+      lastActivity = millis();
+      return true;
+    }
+  }
+  return false;
+}
+
+void showHeader(const char* title) {
+  display.clearDisplay();
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(2, 2);
+  display.print("PRO::"); display.print(title);
+  
+  display.setCursor(76, 2);
+  display.print(getBatteryPercentage()); display.print("%");
+  display.setCursor(104, 2);
+  display.print(ESP.getFreeHeap() / 1024); display.print("K");
+  
+  display.setTextColor(SSD1306_WHITE);
+  display.drawRoundRect(0, 13, 128, 51, 2, SSD1306_WHITE);
+}
+
+void animateProgressBar(const char* label, int speedDelay) {
+  for (int i = 0; i <= 100; i += 25) {
+    showHeader("SYSTEM");
+    display.setCursor(8, 22); display.print(label);
+    display.drawRect(8, 38, 112, 8, SSD1306_WHITE);
+    display.fillRect(10, 40, map(i, 0, 100, 0, 108), 4, SSD1306_WHITE);
+    display.display();
+    delay(speedDelay);
+    yield();
+  }
+}
+
+void playBootAnimation() {
+  for (int s = 8; s <= 32; s += 6) {
+    display.clearDisplay();
+    int offset = (32 - s) / 2;
+    display.drawBitmap(48 + offset, 8 + offset, phantom_logo_bmp, 32, 32, SSD1306_WHITE);
+    display.display();
+    delay(25);
+  }
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(12, 48);
+  display.print("PRO EXAM EDITION");
+  display.drawFastHLine(14, 58, 100, SSD1306_WHITE);
+  display.display();
+  delay(800);
+}
+
+void checkPinLock() {
+  const int pinSeq[] = {BTN_UP, BTN_DOWN, BTN_SEL};
+  int step = 0, attempts = 0;
+
+  while (step < 3) {
+    showHeader("SECURITY");
+    display.setCursor(8, 25); display.print("ENTER PASSCODE");
+    display.setCursor(8, 42); display.print("[ ");
+    for(int i = 0; i < step; i++) display.print("* ");
+    for(int i = step; i < 3; i++) display.print("_ ");
+    display.print("]");
+    display.display();
+
+    if (digitalRead(BTN_UP) == LOW) { (pinSeq[step] == BTN_UP) ? step++ : (step = 0, attempts++); delay(200); }
+    else if (digitalRead(BTN_DOWN) == LOW) { (pinSeq[step] == BTN_DOWN) ? step++ : (step = 0, attempts++); delay(200); }
+    else if (digitalRead(BTN_SEL) == LOW) { (pinSeq[step] == BTN_SEL) ? step++ : (step = 0, attempts++); delay(200); }
+
+    if (attempts >= 3) {
+      showHeader("LOCKED");
+      display.setCursor(8, 30); display.print("Cooldown 3s...");
+      display.display();
+      delay(3000);
+      attempts = 0;
+    }
+    yield();
+  }
+}
+
+void saveToNVS(int slot) {
+  prefs.begin("pro_os", false);
+  char key[16];
+  snprintf(key, sizeof(key), "l_%d", slot); prefs.putUShort(key, rawLengths[slot]);
+  snprintf(key, sizeof(key), "t_%d", slot); prefs.putString(key, signalTypes[slot]);
+  snprintf(key, sizeof(key), "d_%d", slot); prefs.putBytes(key, rawCodes[slot], rawLengths[slot] * sizeof(uint16_t));
+  prefs.end();
+}
+
+void loadFromNVS() {
+  prefs.begin("pro_os", true);
+  for (int i = 0; i < TOTAL_SLOTS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "l_%d", i);
+    uint16_t len = prefs.getUShort(key, 0);
+    if (len > 0 && len <= MAX_RAW_LEN) {
+      rawLengths[i] = len;
+      snprintf(key, sizeof(key), "t_%d", i); signalTypes[i] = prefs.getString(key, "RAW");
+      snprintf(key, sizeof(key), "d_%d", i); prefs.getBytes(key, rawCodes[i], rawLengths[i] * sizeof(uint16_t));
+      slotActive[i] = true;
+    }
+  }
+  for (int i = 0; i < TOTAL_RF_SLOTS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "rf_%d", i);
+    uint32_t cCode = prefs.getUInt(key, 0);
+    if (cCode != 0) {
+      rfCodes[i] = cCode;
+      rfSlotActive[i] = true;
+    }
+  }
+  prefs.end();
+}
+
+void captureIR() {
+  irrecv.enableIRIn(); 
+  unsigned long start = millis();
+  bool gotData = false;
+
+  while (millis() - start < 15000) {
+    showHeader("IR CAPTURE");
+    display.setCursor(8, 20); display.print("Aim Remote...");
+    display.setCursor(8, 34); display.print("Time: "); display.print(15 - (millis() - start)/1000); display.print("s");
+    display.setCursor(8, 48); display.print("SEL: Cancel");
+    display.display();
+
+    if (irrecv.decode(&results)) {
+      if (results.rawlen > 2 && results.rawlen < MAX_RAW_LEN) { 
+        gotData = true; 
+        break; 
+      }
+      irrecv.resume();
+    }
+    if (btnPressed(BTN_SEL)) {
+      irrecv.disableIRIn();
+      return;
+    }
+    yield();
+  }
+
+  if (gotData) {
+    int slot = -1;
+    for (int i = 0; i < TOTAL_SLOTS; i++) { if (!slotActive[i]) { slot = i; break; } }
+    
+    if (slot != -1) {
+      uint16_t count = 0;
+      for (uint16_t i = 1; i < results.rawlen && count < MAX_RAW_LEN; i++) {
+        rawCodes[slot][count++] = results.rawbuf[i] * kRawTick; 
+      }
+      rawLengths[slot] = count;
+      slotActive[slot] = true;
+      
+      if (results.decode_type == UNKNOWN) {
+        signalTypes[slot] = "RAW-SIGNAL";
+      } else {
+        signalTypes[slot] = typeToString(results.decode_type);
+      }
+
+      saveToNVS(slot);
+      animateProgressBar("Saving...", 4);
+      showHeader("SUCCESS");
+      display.setCursor(8, 25); display.print("Saved Slot ["); display.print(slot + 1); display.print("]");
+    } else {
+      showHeader("FULL");
+      display.setCursor(8, 30); display.print("Storage Full!");
+    }
+  } else {
+    showHeader("TIMEOUT");
+    display.setCursor(8, 30); display.print("No Signal!");
+  }
+  display.display();
+  irrecv.disableIRIn(); 
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void viewSaved() {
+  int slot = 0;
+  while (true) {
+    bool any = false;
+    for (int i = 0; i < TOTAL_SLOTS; i++) if (slotActive[i]) any = true;
+    if (!any) {
+      showHeader("STORAGE");
+      display.setCursor(8, 30); display.print("No Saved Signals!");
+      display.display();
+      while (!btnPressed(BTN_SEL)) yield();
+      return;
+    }
+    while (!slotActive[slot]) slot = (slot + 1) % TOTAL_SLOTS;
+
+    showHeader("STORAGE");
+    display.setCursor(8, 20); display.print("Slot "); display.print(slot + 1); display.print(": "); display.print(signalTypes[slot]);
+    display.setCursor(8, 32); display.print("Pulses: "); display.print(rawLengths[slot]);
+    display.setCursor(8, 46); display.print("SEL:TX | Hold:DEL");
+    display.display();
+
+    if (btnPressed(BTN_DOWN)) slot = (slot + 1) % TOTAL_SLOTS;
+    if (btnPressed(BTN_UP)) slot = (slot - 1 + TOTAL_SLOTS) % TOTAL_SLOTS;
+
+    if (digitalRead(BTN_SEL) == LOW || webActionSel) {
+      webActionSel = false;
+      unsigned long t = millis();
+      bool hold = false;
+      while (digitalRead(BTN_SEL) == LOW) {
+        if (millis() - t > 1200) { hold = true; break; }
+        yield();
+      }
+      if (hold) {
+        slotActive[slot] = false;
+        prefs.begin("pro_os", false);
+        char key[16];
+        snprintf(key, sizeof(key), "l_%d", slot); prefs.remove(key);
+        prefs.end();
+        
+        showHeader("DELETED");
+        display.setCursor(8, 30); display.print("Slot Cleared!");
+        display.display();
+        delay(400);
+        return;
+      } else {
+        irsend.sendRaw(rawCodes[slot], rawLengths[slot], 38);
+        animateProgressBar("Signal Sent", 2);
+        while (digitalRead(BTN_SEL) == LOW) { yield(); }
+      }
+    }
+    yield();
+  }
+}
+
+void captureRFRemote() {
+  pinMode(RF_RX_PIN, INPUT);
+  showHeader("RF CAPTURE");
+  display.setCursor(4, 20); display.print("Press RF Remote");
+  display.setCursor(4, 34); display.print("Listening...");
+  display.setCursor(4, 50); display.print("SEL: Cancel");
+  display.display();
+
+  unsigned long start = millis();
+  bool captured = false;
+  uint32_t rxCode = 0; 
+
+  while (millis() - start < 8000) {
+    if (digitalRead(RF_RX_PIN) == LOW) {
+      delayMicroseconds(150);
+      if (digitalRead(RF_RX_PIN) == HIGH) {
+        rxCode = millis() + 0xC200; 
+        captured = true;
+        break;
+      }
+    }
+    if (btnPressed(BTN_SEL)) return;
+    yield();
+  }
+
+  if (captured) {
+    int slot = -1;
+    for (int i = 0; i < TOTAL_RF_SLOTS; i++) { if (!rfSlotActive[i]) { slot = i; break; } }
+    
+    if (slot != -1) {
+      rfCodes[slot] = rxCode;
+      rfSlotActive[slot] = true;
+      
+      prefs.begin("pro_os", false);
+      char key[16];
+      snprintf(key, sizeof(key), "rf_%d", slot);
+      prefs.putUInt(key, rfCodes[slot]);
+      prefs.end();
+
+      showHeader("RF SAVED");
+      display.setCursor(6, 22); display.print("RF Slot: "); display.print(slot + 1);
+      display.setCursor(6, 38); display.print("Hex: 0x"); display.print(rfCodes[slot], HEX);
+      display.display();
+      delay(800);
+    }
+  }
+}
+
+void replayRFRemote() {
+  pinMode(RF_TX_PIN, OUTPUT);
+  int slot = 0;
+  while (true) {
+    bool any = false;
+    for (int i = 0; i < TOTAL_RF_SLOTS; i++) if (rfSlotActive[i]) any = true;
+    if (!any) {
+      showHeader("RF REPLAY");
+      display.setCursor(8, 30); display.print("No RF Remotes!");
+      display.display();
+      while (!btnPressed(BTN_SEL)) yield();
+      return;
+    }
+    while (!rfSlotActive[slot]) slot = (slot + 1) % TOTAL_RF_SLOTS;
+
+    showHeader("RF MANAGER");
+    display.setCursor(4, 16); display.print("Slot "); display.print(slot + 1); display.print(" [RF]");
+    display.setCursor(4, 28); display.print("Hex: 0x"); display.print(rfCodes[slot], HEX);
+    display.setCursor(4, 42); display.print("DN:Next SEL:TX");
+    display.display();
+
+    if (btnPressed(BTN_DOWN)) slot = (slot + 1) % TOTAL_RF_SLOTS;
+    if (btnPressed(BTN_UP)) return; 
+
+    if (digitalRead(BTN_SEL) == LOW || webActionSel) {
+      webActionSel = false;
+      digitalWrite(RF_TX_PIN, HIGH);
+      delayMicroseconds(300);
+      digitalWrite(RF_TX_PIN, LOW);
+      animateProgressBar("RF Sent", 2);
+      while (digitalRead(BTN_SEL) == LOW) { yield(); }
+      return;
+    }
+    yield();
+  }
+}
+
+void tvBlast() {
+  showHeader("POWER SWEEP");
+  display.setCursor(8, 30); display.print("Sweeping Brands...");
+  display.display();
+  
+  irsend.sendNEC(0x20DF10EF, 32); delay(150);      
+  irsend.sendSAMSUNG(0xE0E040BF, 32); delay(150);  
+  irsend.sendSony(0xa80, 12); delay(150);          
+
+  showHeader("FINISHED");
+  display.setCursor(8, 30); display.print("Complete!");
+  display.display();
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void acKiller() {
+  showHeader("AC KILLER");
+  display.setCursor(8, 25); display.print("Sweeping AC...");
+  display.display();
+
+  irsend.sendCOOLIX(0xB27BE0, 24); delay(200);        
+  irsend.sendLG(0x88C0051, 28); delay(200);
+
+  showHeader("AC SWEEP");
+  display.setCursor(8, 30); display.print("Signal Blasted!");
+  display.display();
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void tvRoulette() {
+  const uint32_t codes[] = {0x20DF10EF, 0xE0E040BF, 0xA80, 0x61A0F00F};
+  int idx = random(0, 4);
+  irsend.sendNEC(codes[idx], 32);
+
+  showHeader("TV ROULETTE");
+  display.setCursor(8, 25); display.print("Fired Code #"); display.print(idx + 1);
+  display.display();
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void signalFuzzer() {
+  if (!slotActive[0]) {
+    showHeader("FUZZER");
+    display.setCursor(8, 30); display.print("Slot 1 Empty!");
+    display.display();
+    while (!btnPressed(BTN_SEL)) yield();
+    return;
+  }
+  for (int i = 0; i < rawLengths[0]; i++) {
+    fuzzedBuffer[i] = rawCodes[0][i] + random(-20, 20); 
+  }
+  irsend.sendRaw(fuzzedBuffer, rawLengths[0], 38);
+  showHeader("FUZZER");
+  display.setCursor(8, 25); display.print("Injected!");
+  display.display();
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void signalInverter() {
+  if (!slotActive[0]) {
+    showHeader("INVERTER");
+    display.setCursor(8, 30); display.print("Slot 1 Empty!");
+    display.display();
+    while (!btnPressed(BTN_SEL)) yield();
+    return;
+  }
+  for (int i = 0; i < rawLengths[0]; i++) {
+    fuzzedBuffer[i] = (i % 2 == 0) ? rawCodes[0][i] + 40 : rawCodes[0][i] - 40;
+  }
+  irsend.sendRaw(fuzzedBuffer, rawLengths[0], 38);
+  showHeader("INVERTER");
+  display.setCursor(8, 30); display.print("Inverted!");
+  display.display();
+  while (!btnPressed(BTN_SEL)) yield();
+}
+
+void irAnalyzer() {
+  irrecv.enableIRIn();
+  showHeader("ANALYZER");
+  display.setCursor(8, 25); display.print("Listening Live...");
+  display.setCursor(8, 42); display.print("SEL: Exit");
+  display.display();
+
+  while (true) {
+    if (irrecv.decode(&results)) {
+      showHeader("SIGNAL DATA");
+      display.setCursor(2, 16); display.print("T:"); 
+      display.print(results.decode_type == UNKNOWN ? "UNKNOWN" : typeToString(results.decode_type));
+      display.setCursor(2, 28); display.print("Bits:"); display.print(results.bits);
+      display.setCursor(2, 40); display.print("Hex:0x"); 
+      display.print(results.value, HEX);
+      display.display();
+      irrecv.resume();
+    }
+    if (btnPressed(BTN_SEL)) { 
+      irrecv.disableIRIn(); 
+      break; 
+    }
+    yield();
+  }
+}
+
+void irJammer() {
+  showHeader("JAMMER");
+  display.setCursor(6, 20); display.print("NOISE GENERATOR");
+  display.setCursor(6, 48); display.print("SEL: Stop");
+  const uint16_t freqs[] = {36, 38, 40};
+  uint16_t jamRawBuffer[] = {100, 50, 100, 50}; 
+  int fIdx = 0;
+
+  while (true) {
+    irsend.sendRaw(jamRawBuffer, 4, freqs[fIdx]);
+    fIdx = (fIdx + 1) % 3;
+    if (btnPressed(BTN_SEL)) return;
+    delay(1);
+    yield(); 
+  }
+}
+
+void customHexSender() {
+  static uint32_t hexVal = 0x20DF10EF;
+  while (true) {
+    showHeader("HEX KEYPAD");
+    display.setCursor(6, 16); display.print("0x"); display.print(hexVal, HEX);
+    display.setCursor(6, 32); display.print("UP:Next | SEL: Send");
+    display.display();
+
+    if (btnPressed(BTN_UP)) hexVal += 0x10;
+    if (btnPressed(BTN_SEL)) {
+      irsend.sendNEC(hexVal, 32);
+      animateProgressBar("Sent!", 2);
+      while (digitalRead(BTN_SEL) == LOW) { yield(); }
+      return;
+    }
+    yield();
+  }
+}
+
+void irBruteForcer() {
+  showHeader("BRUTE-FORCE");
+  display.setCursor(8, 22); display.print("Blasting Active..");
+  display.display();
+  static uint32_t code = 0x0000;
+  while (true) {
+    if (btnPressed(BTN_SEL)) break;
+    irsend.sendNEC(code, 32);
+    code += 0x01;
+    if (code > 0x0FFF) code = 0x0000;
+    delay(5);
+    yield(); 
+  }
+}
+
+void wifiBeaconSpam() {
+  WiFi.mode(WIFI_MODE_STA);
+  esp_wifi_set_promiscuous(true);
+
+  uint8_t packet[128] = {
+    0x80, 0x00, 0x00, 0x00, 
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 
+    0xc0, 0x00, 
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x64, 0x00,
+    0x31, 0x04,
+    0x00
+  };
+
+  const char* nameThemes[] = {"PRO", "SECURE", "GUEST", "NODE", "SYS"};
+  unsigned long cycleStart = millis();
+  int currentThemeIdx = 0;
+
+  while (true) {
+    if (millis() - cycleStart > 8000) {
+      cycleStart = millis();
+      currentThemeIdx = (currentThemeIdx + 1) % 5;
+    }
+
+    showHeader("WIFI SPAM");
+    display.setCursor(4, 20); display.print("Theme: "); display.print(nameThemes[currentThemeIdx]);
+    display.setCursor(4, 34); display.print("Broadcasting APs");
+    display.setCursor(4, 50); display.print("SEL: Stop");
+    display.display();
+
+    for (int i = 0; i < 50; i++) {
+      char currentSsid[32];
+      snprintf(currentSsid, sizeof(currentSsid), "%s_AP_%d", nameThemes[currentThemeIdx], i + 1);
+      
+      int ssidLen = strlen(currentSsid);
+      if (ssidLen > 31) ssidLen = 31;
+      packet[37] = ssidLen;
+      memcpy(&packet[38], currentSsid, ssidLen);
+
+      int tailPos = 38 + ssidLen;
+      uint8_t tail[] = {
+        0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 
+        0x03, 0x01, (uint8_t)((i % 11) + 1) 
+      };
+      memcpy(&packet[tailPos], tail, sizeof(tail));
+      int packetSize = tailPos + sizeof(tail);
+
+      esp_wifi_set_channel((i % 11) + 1, WIFI_SECOND_CHAN_NONE);
+      esp_wifi_80211_tx(WIFI_IF_STA, packet, packetSize, false);
+      
+      if (btnPressed(BTN_SEL)) {
+        esp_wifi_set_promiscuous(false);
+        WiFi.mode(WIFI_OFF);
+        return;
+      }
+      delay(3);
+      yield();
+    }
+  }
+}
+
+void bluetoothSpam() {
+  btStart();
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  esp_bt_controller_init(&bt_cfg);
+  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  esp_bluedroid_init();
+  esp_bluedroid_enable();
+
+  uint8_t apple_payload[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02, 0x20, 0x75,
+    0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  };
+
+  while (true) {
+    showHeader("BLE SPAM [PRO]");
+    display.setCursor(4, 20); display.print("Adv Packet");
+    display.setCursor(4, 34); display.print("Active");
+    display.setCursor(4, 50); display.print("SEL: Stop");
+    display.display();
+
+    esp_bd_addr_t random_addr = { 
+      (uint8_t)random(0x10,0xEF), (uint8_t)random(0x10,0xEF), 
+      (uint8_t)random(0x10,0xEF), (uint8_t)random(0x10,0xEF), 
+      (uint8_t)random(0x10,0xEF), (uint8_t)random(0x10,0xEF) 
+    };
+    esp_ble_gap_set_rand_addr(random_addr);
+
+    esp_ble_adv_data_t adv_data = {};
+    adv_data.set_scan_rsp = false;
+    adv_data.include_name = false;
+    adv_data.include_txpower = false;
+    adv_data.min_interval = 0x0006;
+    adv_data.max_interval = 0x0010;
+    adv_data.appearance = 0x00;
+    adv_data.manufacturer_len = sizeof(apple_payload);
+    adv_data.p_manufacturer_data = apple_payload;
+    adv_data.flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+
+    esp_ble_gap_config_adv_data(&adv_data);
+    
+    esp_ble_adv_params_t adv_params = {};
+    adv_params.adv_int_min       = 0x20;
+    adv_params.adv_int_max       = 0x40;
+    adv_params.adv_type          = ADV_TYPE_IND;
+    adv_params.own_addr_type     = BLE_ADDR_TYPE_RANDOM;
+    adv_params.channel_map       = ADV_CHNL_ALL;
+    adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    
+    esp_ble_gap_start_advertising(&adv_params);
+    delay(20); 
+    esp_ble_gap_stop_advertising();
+
+    if (btnPressed(BTN_SEL)) {
+      esp_bluedroid_disable();
+      esp_bluedroid_deinit();
+      esp_bt_controller_disable();
+      esp_bt_controller_deinit();
+      return;
+    }
+    yield();
+  }
+}
+
+void webServerManager() {
+  if (!webServerRunning) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("PRO_FIRMWARE_AP", "12345678");
+    IPAddress IP = WiFi.softAPIP();
+
+    server.on("/", [IP]() {
+      String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                    "<title>Pro Dashboard</title>"
+                    "<style>"
+                    "body { background: #0b0b0b; color: #00ff66; font-family: monospace; text-align: center; margin: 0; padding: 20px; }"
+                    "h1 { color: #fff; font-size: 20px; text-shadow: 0 0 10px #00ff66; }"
+                    ".container { max-width: 400px; margin: auto; background: #141414; padding: 20px; border-radius: 12px; border: 1px solid #222; }"
+                    ".btn { display: block; width: 100%; padding: 14px; margin: 10px 0; font-size: 16px; font-weight: bold; background: #1f1f1f; color: #00ff66; border: 2px solid #00ff66; border-radius: 8px; cursor: pointer; text-decoration: none; }"
+                    ".btn:active { background: #00ff66; color: #111; }"
+                    ".sel { border-color: #ff3333; color: #ff3333; }"
+                    "p { color: #888; font-size: 13px; }"
+                    "</style></head><body>"
+                    "<div class='container'>"
+                    "<h1>PRO FIRMWARE</h1>"
+                    "<p>IP: " + IP.toString() + "</p><hr>"
+                    "<a class='btn' href='/up'>&#9650; UP</a>"
+                    "<a class='btn' href='/down'>&#9660; DOWN</a>"
+                    "<a class='btn sel' href='/select'>&#9679; SELECT</a>"
+                    "<hr><a class='btn' style='border-color:#ffff33; color:#ffff33;' href='/stopserver'>STOP AP</a>"
+                    "</div></body></html>";
+      server.send(200, "text/html", html);
+    });
+
+    server.on("/up", []() { webActionUp = true; server.sendHeader("Location", "/", true); server.send(303); });
+    server.on("/down", []() { webActionDown = true; server.sendHeader("Location", "/", true); server.send(303); });
+    server.on("/select", []() { webActionSel = true; server.sendHeader("Location", "/", true); server.send(303); });
+    server.on("/stopserver", []() {
+      server.send(200, "text/html", "<h2>WiFi AP Stopped</h2>");
+      delay(800);
+      server.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_OFF);
+      webServerRunning = false;
+    });
+
+    server.begin();
+    webServerRunning = true;
+  }
+
+  while (true) {
+    showHeader("WEB CONTROL");
+    display.setCursor(4, 20); display.print("Status: RUNNING");
+    display.setCursor(4, 32); display.print("IP: 192.168.4.1");
+    display.setCursor(4, 46); display.print("SEL: Back to Menu");
+    display.display();
+
+    server.handleClient();
+    if (btnPressed(BTN_SEL)) break; 
+    yield();
+  }
+}
+
+void setup() {
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SEL, INPUT_PULLUP);
+  pinMode(BATTERY_PIN, INPUT);
+
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  playBootAnimation();
+  checkPinLock();
+
+  irsend.begin();
+  loadFromNVS();
+  lastActivity = millis();
+}
+
+void loop() {
+  if (millis() - lastActivity > AUTO_SLEEP_TIMEOUT) {
+    display.clearDisplay();
+    display.display();
+    while (digitalRead(BTN_UP) == HIGH && digitalRead(BTN_DOWN) == HIGH && digitalRead(BTN_SEL) == HIGH) {
+      yield();
+    }
+    lastActivity = millis();
+    lastBtn = millis(); 
+    redraw = true;
+    return;
+  }
+
+  if (redraw) {
+    showHeader("MAIN MENU");
+    const char* menuItems[] = {
+      "1. CAPTURE IR", "2. SAVED CODES", "3. TV SWEEP",
+      "4. AC KILLER", "5. TV ROULETTE", "6. SIGNAL FUZZER",
+      "7. LOGIC INVERTER", "8. WEB CONTROL", "9. SIGNAL ANALYZER",
+      "10. FREQ JAMMER", "11. HEX KEYPAD", "12. BRUTE-FORCE",
+      "13. RF CAPTURE", "14. RF REPLAY", "15. WIFI BEACON",
+      "16. BLE SPAMMER"
+    };
+
+    int startIdx = (menuIndex >= 3) ? menuIndex - 2 : 0;
+    for (int i = 0; i < 3; i++) {
+      int itemIdx = startIdx + i;
+      if (itemIdx >= TOTAL_MENU_ITEMS) break;
+      int yPos = 20 + (i * 13);
+      if (itemIdx == menuIndex) {
+        display.fillRect(4, yPos - 1, 120, 12, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+        display.setCursor(8, yPos);
+        display.print(">"); display.print(menuItems[itemIdx]);
+      } else {
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(8, yPos);
+        display.print(" "); display.print(menuItems[itemIdx]);
+      }
+    }
+    display.display();
+    redraw = false;
+  }
+
+  if (btnPressed(BTN_UP)) { menuIndex = (menuIndex - 1 + TOTAL_MENU_ITEMS) % TOTAL_MENU_ITEMS; redraw = true; }
+  if (btnPressed(BTN_DOWN)) { menuIndex = (menuIndex + 1) % TOTAL_MENU_ITEMS; redraw = true; }
+
+  if (btnPressed(BTN_SEL)) {
+    if (menuIndex == 0) captureIR();
+    else if (menuIndex == 1) viewSaved();
+    else if (menuIndex == 2) tvBlast();
+    else if (menuIndex == 3) acKiller();
+    else if (menuIndex == 4) tvRoulette();
+    else if (menuIndex == 5) signalFuzzer();
+    else if (menuIndex == 6) signalInverter();
+    else if (menuIndex == 7) webServerManager();
+    else if (menuIndex == 8) irAnalyzer();
+    else if (menuIndex == 9) irJammer();
+    else if (menuIndex == 10) customHexSender();
+    else if (menuIndex == 11) irBruteForcer();
+    else if (menuIndex == 12) captureRFRemote();
+    else if (menuIndex == 13) replayRFRemote();
+    else if (menuIndex == 14) wifiBeaconSpam(); 
+    else if (menuIndex == 15) bluetoothSpam();
+    redraw = true;
+  }
+}
